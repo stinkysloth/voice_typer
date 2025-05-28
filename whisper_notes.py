@@ -14,10 +14,10 @@ from pynput import keyboard
 import subprocess
 import tempfile
 import json
-from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMessageBox, QFileDialog,
+from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMessageBox, QFileDialog,
                                QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton, QDialogButtonBox)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor
-from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QMutex, QCoreApplication, QSettings, QStandardPaths
+from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor
+from PyQt6.QtCore import QObject, QThread, pyqtSignal as Signal, Qt, QTimer, QMutex, QCoreApplication, QSettings, QStandardPaths
 
 # Import journaling module
 try:
@@ -29,6 +29,9 @@ except ImportError:
             pass
         def create_journal_entry(self, *args, **kwargs):
             return {'error': 'Journaling not available'}
+
+# Import our custom calendar widget
+from calendar_widget import CalendarWidget
 
 # Configure logging
 logging.basicConfig(
@@ -338,8 +341,8 @@ class RecordingThread(QThread):
         self.stop_flag = True
 
 
-class VoiceTyper(QObject):
-    """Main application class for Voice Typer."""
+class WhisperNotes(QObject):
+    """Main application class for WhisperNotes."""
     toggle_recording_signal = Signal()
     toggle_journal_signal = Signal()
     quit_signal = Signal()
@@ -474,6 +477,11 @@ class VoiceTyper(QObject):
         self.journal_action.triggered.connect(self.toggle_journal_mode)
         menu.addAction(self.journal_action)
         
+        # Add calendar view action
+        self.calendar_action = QAction("Calendar View", self)
+        self.calendar_action.triggered.connect(self.show_calendar)
+        menu.addAction(self.calendar_action)
+        
         menu.addSeparator()
         
         # Output settings submenu
@@ -514,7 +522,7 @@ class VoiceTyper(QObject):
 
         menu.addSeparator()
 
-        quit_action = QAction("Quit Voice Typer (Cmd+Q)", self)
+        quit_action = QAction("Quit WhisperNotes (Cmd+Q)", self)
         quit_action.triggered.connect(self.quit)  # Connect to the existing quit method
         menu.addAction(quit_action)
 
@@ -1243,9 +1251,49 @@ class VoiceTyper(QObject):
         logging.info("[VoiceTyper] Clearing self.transcriber reference after it finished and deleteLater was called.")
         self.transcriber = None
 
-    def _clear_transcription_thread_references(self):
-        logging.info("[VoiceTyper] Clearing self.transcription_thread reference after it finished and deleteLater was called.")
-        self.transcription_thread = None
+    def show_calendar(self):
+        """Show the calendar widget with recording dates."""
+        try:
+            # If the calendar is already open, bring it to the front
+            if hasattr(self, "calendar_widget") and self.calendar_widget is not None:
+                if self.calendar_widget.isVisible():
+                    self.calendar_widget.raise_()
+                    self.calendar_widget.activateWindow()
+                    return
+            # Get the journal recordings directory
+            recordings_dir = os.path.join(self.journal_manager.output_dir, "recordings")
+            # Create and show the calendar widget
+            self.calendar_widget = CalendarWidget(None, recordings_dir)
+            self.calendar_widget.date_selected.connect(self.on_calendar_date_selected)
+            self.calendar_widget.destroyed.connect(lambda: setattr(self, "calendar_widget", None))
+            self.calendar_widget.show()
+        except Exception as e:
+            logging.error(f"Error showing calendar: {e}", exc_info=True)
+            self.tray_icon.showMessage(
+                "WhisperNotes", 
+                f"Error showing calendar: {str(e)}", 
+                QSystemTrayIcon.MessageIcon.Critical, 
+                5000
+            )
+
+    def on_calendar_date_selected(self, date_str):
+        """
+        Handle a date selection from the calendar.
+        Args:
+            date_str (str): The selected date in YYYY-MM-DD format.
+        """
+        try:
+            logging.info(f"Calendar date selected: {date_str}")
+            self.tray_icon.showMessage(
+                "WhisperNotes",
+                f"Selected recordings from {date_str}",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+        except Exception as e:
+            logging.error(f"Error handling calendar date selection: {e}", exc_info=True)
+
+
 
     def quit(self):
         """Quit the application."""
@@ -1327,7 +1375,7 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)
     
     # Create and show the voice typer
-    voice_typer = VoiceTyper(app)
+    whisper_notes = WhisperNotes(app)
     
     # Start the event loop
     sys.exit(app.exec())

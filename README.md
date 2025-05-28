@@ -55,7 +55,7 @@ Transform your spoken thoughts into organized, searchable journal entries with A
 
 2. **Clone this repository** or download the source code:
    ```bash
-   git clone https://github.com/stinkysloth/WhisperNotes.git
+   git clone https://github.com/pieChartsAreLies/WhisperNotes.git
    cd WhisperNotes
    ```
 
@@ -90,7 +90,7 @@ Transform your spoken thoughts into organized, searchable journal entries with A
 
 2. **Clone this repository** or download the source code:
    ```cmd
-   git clone https://github.com/stinkysloth/WhisperNotes.git
+   git clone https://github.com/pieChartsAreLies/WhisperNotes.git
    cd WhisperNotes
    ```
 
