@@ -592,7 +592,8 @@ class WhisperNotes(QObject):
             on_quit=self.quit,
             on_edit_prompt=self.prompt_edit_summary_prompt,
             on_set_journal_dir=self.prompt_set_journal_dir,
-            on_configure_templates=self.open_template_config_dialog
+            on_configure_templates=self.open_template_config_dialog,
+            on_import_audio=self.import_audio_files
         )
         logging.info("Setting up HotkeyManager in __init__")
         self.hotkey_manager = HotkeyManager(
@@ -1426,6 +1427,545 @@ class WhisperNotes(QObject):
 
             self.tray_manager.tray_icon.showMessage("Settings Updated", f"Transcription output file set to:\n{file_path}", QSystemTrayIcon.MessageIcon.Information, 3000)
             
+    def import_audio_files(self):
+        """Handle importing and transcribing multiple audio files."""
+        try:
+            # Get the directory containing the script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Open directory selection dialog
+            dir_path = QFileDialog.getExistingDirectory(
+                None,
+                "Select Directory with Audio Files",
+                script_dir,  # Default to script directory
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
+            
+            if not dir_path:  # User cancelled
+                return
+                
+            # Get list of supported audio files
+            supported_extensions = ('.wav', '.mp3', '.m4a', '.amr')
+            audio_files = []
+            
+            # Scan directory for audio files
+            for root, _, files in os.walk(dir_path):
+                for file in files:
+                    if file.lower().endswith(supported_extensions):
+                        audio_files.append(os.path.join(root, file))
+            
+            if not audio_files:
+                self.show_warning_dialog.emit(
+                    "No Audio Files Found",
+                    f"No supported audio files (.wav, .mp3, .m4a, .amr) found in:\n{dir_path}"
+                )
+                return
+                
+            # Sort files by name (which often includes timestamp)
+            audio_files.sort()
+            
+            # Ask for confirmation
+            reply = QMessageBox.question(
+                None,
+                "Import Audio Files",
+                f"Found {len(audio_files)} audio files. Process them now?\n\n"
+                f"First file: {os.path.basename(audio_files[0])}\n"
+                f"Last file: {os.path.basename(audio_files[-1])}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                self._process_audio_files(audio_files)
+                
+        except Exception as e:
+            error_msg = handle_error(e, "importing audio files")
+            self.show_error_dialog.emit("Import Error", error_msg)
+            logging.error(f"Error in import_audio_files: {str(e)}", exc_info=True)
+    
+    def _format_file_size(self, size_bytes):
+        """Format file size in a human-readable format."""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+
+    def _format_duration(self, seconds):
+        """Format duration in a human-readable format."""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes = int(seconds // 60)
+        seconds = seconds % 60
+        if minutes < 60:
+            return f"{minutes}m {seconds:.0f}s"
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours}h {minutes}m {seconds:.0f}s"
+
+    def _load_audio_as_array(self, file_path):
+        """
+        Load an audio file as a numpy array and return (audio_data, sample_rate).
+        If the format is not supported by soundfile, auto-convert to WAV using pydub/ffmpeg.
+        """
+        import soundfile as sf
+        import os, tempfile
+        try:
+            audio_data, sample_rate = sf.read(file_path)
+            return audio_data, sample_rate
+        except Exception as e:
+            # Try conversion for unsupported formats
+            try:
+                from pydub import AudioSegment
+            except ImportError:
+                raise RuntimeError(f"Audio format not supported and pydub not installed: {e}")
+            try:
+                audio = AudioSegment.from_file(file_path)
+            except Exception as conv_e:
+                raise RuntimeError(f"Format not recognised and conversion failed: {conv_e}")
+            import shutil
+            debug_dir = os.path.join(os.path.dirname(__file__), 'converted_audio_debug')
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_wav_path = os.path.join(debug_dir, os.path.splitext(os.path.basename(file_path))[0] + '.wav')
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
+                audio.export(tmp_wav.name, format='wav')
+                tmp_wav_path = tmp_wav.name
+            # Save a copy for inspection
+            shutil.copy(tmp_wav_path, debug_wav_path)
+            print(f"[DEBUG] Converted audio saved to: {debug_wav_path}")
+            try:
+                audio_data, sample_rate = sf.read(tmp_wav_path)
+            finally:
+                os.remove(tmp_wav_path)
+            return audio_data, sample_rate
+
+    def _transcribe_audio_file_blocking(self, audio_file_path: str) -> str:
+        """
+        Transcribe an audio file synchronously using TranscriptionWorker in a local thread.
+        Returns the transcript as a string.
+        """
+        import threading
+        from transcription import TranscriptionWorker
+        from PySide6.QtCore import QEventLoop
+        transcript_result = {'text': None, 'error': None}
+        loop = QEventLoop()
+        def on_ready(text):
+            transcript_result['text'] = text
+            loop.quit()
+        def on_error(msg):
+            transcript_result['error'] = msg
+            loop.quit()
+        audio_data, _ = self._load_audio_as_array(audio_file_path)
+        worker = TranscriptionWorker(model_name="base", audio_data=audio_data)
+        worker.transcription_ready.connect(on_ready)
+        worker.error.connect(on_error)
+        worker.finished.connect(loop.quit)
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        loop.exec()
+        thread.join()
+        if transcript_result['error']:
+            raise Exception(transcript_result['error'])
+        return transcript_result['text']
+
+    def _process_audio_files(self, audio_files):
+        """Process a list of audio files for transcription with detailed progress dialog."""
+        import os, time
+        from PySide6.QtWidgets import (QDialog, QLabel, QVBoxLayout, QHBoxLayout, QProgressBar, QDialogButtonBox, QTextEdit, QGroupBox)
+        from PySide6.QtCore import Qt, QTimer
+        from PySide6.QtGui import QFont, QPixmap, QColor, QTextCharFormat, QTextCursor
+        try:
+            from pydub.utils import mediainfo
+        except ImportError:
+            mediainfo = None
+
+        # Helper for file icons
+        def get_icon_for_ext(ext):
+            icon_map = {
+                '.wav': '🎵', '.mp3': '🎶', '.m4a': '🎤', '.amr': '📞'
+            }
+            return icon_map.get(ext.lower(), '📁')
+
+        def get_audio_duration(filepath):
+            if mediainfo:
+                try:
+                    info = mediainfo(filepath)
+                    return float(info.get('duration', 0))
+                except Exception:
+                    return None
+            return None
+
+        # --- Dialog Layout ---
+        dialog = QDialog()
+        dialog.setWindowTitle("Importing Audio Files")
+        dialog.setMinimumWidth(600)
+        main_layout = QVBoxLayout(dialog)
+
+        # Progress Bars
+        pb_group = QGroupBox("Progress")
+        pb_layout = QVBoxLayout()
+        overall_pb = QProgressBar()
+        overall_pb.setMaximum(len(audio_files))
+        overall_pb.setValue(0)
+        overall_pb.setTextVisible(True)
+        overall_pb.setFormat("%v/%m files (%p%)")
+        file_pb = QProgressBar()
+        file_pb.setMaximum(100)
+        file_pb.setValue(0)
+        file_pb.setTextVisible(True)
+        file_pb.setFormat("Current file: %p%")
+        pb_layout.addWidget(overall_pb)
+        pb_layout.addWidget(file_pb)
+        pb_group.setLayout(pb_layout)
+        main_layout.addWidget(pb_group)
+
+        # File Info Section
+        info_group = QGroupBox("Current File Info")
+        info_layout = QHBoxLayout()
+        icon_label = QLabel()
+        icon_label.setFont(QFont("Arial", 32))
+        info_layout.addWidget(icon_label)
+        fileinfo_v = QVBoxLayout()
+        file_label = QLabel()
+        file_label.setFont(QFont("Arial", 12, QFont.Bold))
+        fileinfo_v.addWidget(file_label)
+        details_label = QLabel()
+        details_label.setFont(QFont("Arial", 10))
+        fileinfo_v.addWidget(details_label)
+        status_label = QLabel()
+        status_label.setFont(QFont("Arial", 10))
+        fileinfo_v.addWidget(status_label)
+        fileinfo_v.addStretch()
+        info_layout.addLayout(fileinfo_v)
+        info_group.setLayout(info_layout)
+        main_layout.addWidget(info_group)
+
+        # Transcription Preview
+        preview_group = QGroupBox("Transcription Preview")
+        preview_layout = QVBoxLayout()
+        preview_text = QTextEdit()
+        preview_text.setReadOnly(True)
+        preview_text.setMaximumHeight(80)
+        preview_layout.addWidget(preview_text)
+        preview_group.setLayout(preview_layout)
+        main_layout.addWidget(preview_group)
+
+        # Log Panel
+        log_group = QGroupBox("Import Log")
+        log_layout = QVBoxLayout()
+        log_text = QTextEdit()
+        log_text.setReadOnly(True)
+        log_layout.addWidget(log_text)
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
+        # Time/Rate
+        time_label = QLabel()
+        main_layout.addWidget(time_label)
+
+        # Cancel Button
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        button_box.rejected.connect(dialog.reject)
+        main_layout.addWidget(button_box)
+
+        dialog.setLayout(main_layout)
+        dialog.show()
+
+        # --- Logging Helper ---
+        def log_message(text, color=None):
+            cursor = log_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            fmt = QTextCharFormat()
+            if color:
+                fmt.setForeground(QColor(color))
+            cursor.insertText(text + "\n", fmt)
+            log_text.setTextCursor(cursor)
+            log_text.ensureCursorVisible()
+
+        # --- Processing Loop ---
+        total_size = sum(os.path.getsize(f) for f in audio_files)
+        processed_size = 0
+        start_time = time.time()
+        success_count = 0
+        failed_files = []
+
+        for idx, audio_file in enumerate(audio_files, 1):
+            if not dialog.isVisible():
+                log_message("Import cancelled by user.", "orange")
+                break
+            file_name = os.path.basename(audio_file)
+            ext = os.path.splitext(file_name)[1]
+            icon_label.setText(get_icon_for_ext(ext))
+            file_label.setText(f"{file_name}")
+            file_size = os.path.getsize(audio_file)
+            duration = get_audio_duration(audio_file)
+            size_str = self._format_file_size(file_size)
+            dur_str = f"{duration:.1f}s" if duration else "Unknown"
+            details_label.setText(f"<b>Type:</b> {ext.upper()} | <b>Size:</b> {size_str} | <b>Duration:</b> {dur_str}")
+            preview_text.setPlainText("")
+            status_label.setText("<span style='color:blue'>Queued...</span>")
+            QApplication.processEvents()
+
+            try:
+                status_label.setText("<span style='color:blue'>Transcribing...</span>")
+                t0 = time.time()
+                # --- Actual transcription ---
+                transcript = None
+                try:
+                    transcript = self._transcribe_audio_file_blocking(audio_file)
+                except Exception as e:
+                    raise Exception(f"Transcription failed: {e}")
+                elapsed = time.time() - t0
+                preview_text.setPlainText(transcript or "[No transcript generated]")
+                file_pb.setValue(100)
+                time_label.setText(f"Elapsed: {self._format_duration(elapsed)} | Rate: {self._format_file_size(file_size/(elapsed+0.01))}/s")
+                QApplication.processEvents()
+                if not transcript or not transcript.strip():
+                    raise Exception("Empty transcript")
+                # --- Copy audio file to main recordings storage ---
+                import shutil, os
+                from datetime import datetime
+                home_dir = os.path.expanduser("~")
+                recordings_dir = os.path.join(home_dir, "Documents", "Personal", "Audio Journal", "recordings")
+                os.makedirs(recordings_dir, exist_ok=True)
+                # Use unique filename to avoid collisions
+                base_name = os.path.basename(audio_file)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dest_name = f"imported_{timestamp}_{base_name}"
+                dest_path = os.path.join(recordings_dir, dest_name)
+                try:
+                    shutil.copy2(audio_file, dest_path)
+                    log_message(f"Audio copied to {dest_path}", "gray")
+                except Exception as e:
+                    log_message(f"ERROR copying audio: {e}", "orange")
+                    raise Exception(f"Audio copy failed: {e}")
+
+                # --- Journal entry (main workflow) ---
+                status_label.setText("<span style='color:blue'>Saving to Journal...</span>")
+                QApplication.processEvents()
+                try:
+                    entry = self.handle_journal_entry(transcript)
+                except Exception as e:
+                    raise Exception(f"Journal save failed: {e}")
+                status_label.setText("<span style='color:green'>Success</span>")
+                log_message(f"SUCCESS: {file_name}", "green")
+                success_count += 1
+            except Exception as e:
+                import logging
+                error_msg = f"FAILED: {file_name} (Transcription failed: {e})"
+                print(error_msg)
+                logging.error(error_msg)
+                status_label.setText(f"<span style='color:red'>Error: {e}</span>")
+                log_message(f"FAILED: {file_name} ({e})", "red")
+                failed_files.append((file_name, str(e)))
+                QApplication.processEvents()
+                time.sleep(0.5)
+            overall_pb.setValue(idx)
+            processed_size += file_size
+            QApplication.processEvents()
+
+        # Final status
+        elapsed = time.time() - start_time
+        status = f"Import complete: <span style='color:green'>{success_count} succeeded</span>, <span style='color:red'>{len(failed_files)} failed</span> in {self._format_duration(elapsed)}."
+        log_message(status, "blue")
+        status_label.setText(status)
+        time_label.setText(f"Total elapsed: {self._format_duration(elapsed)} | Total size: {self._format_file_size(processed_size)}")
+        QApplication.processEvents()
+        time.sleep(1)
+        QTimer.singleShot(4000, dialog.accept)
+
+        return success_count, failed_files
+
+        
+        # Create a progress dialog
+        progress_dialog = QProgressDialog(
+            "Processing audio files...",
+            "Cancel",
+            0,
+            len(audio_files),
+            None
+        )
+        progress_dialog.setWindowTitle("Importing Audio Files")
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(True)
+        progress_dialog.setAutoReset(False)
+        
+        # Create a custom widget for detailed progress
+        progress_widget = QDialog()
+        progress_widget.setWindowTitle("Import Progress")
+        progress_widget.setMinimumWidth(500)
+        layout = QVBoxLayout(progress_widget)
+        
+        # Progress group
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout()
+        
+        # Overall progress
+        overall_progress = QProgressBar()
+        overall_progress.setMaximum(len(audio_files))
+        overall_progress.setTextVisible(True)
+        overall_progress.setFormat("%v/%m files (%p%)")
+        progress_layout.addWidget(QLabel("<b>Overall Progress:</b>"))
+        progress_layout.addWidget(overall_progress)
+        
+        # Current file progress
+        file_progress = QProgressBar()
+        file_progress.setMaximum(100)
+        file_progress.setTextVisible(True)
+        file_progress.setFormat("%p%")
+        progress_layout.addWidget(QLabel("<b>Current File Progress:</b>"))
+        progress_layout.addWidget(file_progress)
+        
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+        
+        # Details group
+        details_group = QGroupBox("File Details")
+        details_layout = QVBoxLayout()
+        
+        # File info
+        file_info = QLabel("<b>Current File:</b> Waiting to start...")
+        file_info.setWordWrap(True)
+        details_layout.addWidget(file_info)
+        
+        # Status info
+        status_info = QLabel("<b>Status:</b> Idle")
+        details_layout.addWidget(status_info)
+        
+        # File details
+        details_text = QLabel()
+        details_text.setWordWrap(True)
+        details_layout.addWidget(details_text)
+        
+        # Time info
+        time_info = QLabel()
+        details_layout.addWidget(time_info)
+        
+        # Error info (hidden by default)
+        error_info = QLabel()
+        error_info.setWordWrap(True)
+        error_info.setStyleSheet("color: red;")
+        error_info.hide()
+        details_layout.addWidget(error_info)
+        
+        details_group.setLayout(details_layout)
+        layout.addWidget(details_group)
+        
+        # Add cancel button
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        button_box.rejected.connect(progress_dialog.cancel)
+        layout.addWidget(button_box)
+        
+        progress_widget.setLayout(layout)
+        progress_widget.show()
+        
+        try:
+            processed_count = 0
+            success_count = 0
+            failed_files = []
+            
+            # Show initial notification
+            self.tray_manager.show_notification(
+                "Import Started",
+                f"Starting import of {len(audio_files)} audio files...",
+                QSystemTrayIcon.Information
+            )
+            
+            # Process each file sequentially
+            for i, audio_file in enumerate(audio_files, 1):
+                if progress_dialog.wasCanceled():
+                    status_label.setText("<b>Import cancelled by user</b>")
+                    logging.info(f"Import cancelled by user after processing {i-1} files")
+                    break
+                    
+                # Update progress UI
+                file_name = os.path.basename(audio_file)
+                file_label.setText(f"<b>Processing file {i} of {len(audio_files)}:</b> {file_name}")
+                status_label.setText("Converting audio format..." if audio_file.lower().endswith(('.amr', '.m4a')) 
+                                   else "Transcribing audio...")
+                progress_bar.setValue(i)
+                progress_dialog.setValue(i)
+                
+                # Force UI update
+                QApplication.processEvents()
+                
+                try:
+                    start_time = time.time()
+                    logging.info(f"Processing audio file ({i}/{len(audio_files)}): {file_name}")
+                    
+                    # TODO: Add actual transcription logic here
+                    # For now, simulate processing time based on file size
+                    file_size_mb = os.path.getsize(audio_file) / (1024 * 1024)  # Size in MB
+                    process_time = min(5, max(1, file_size_mb * 0.5))  # 0.5s per MB, max 5s
+                    
+                    # Simulate processing with progress updates
+                    steps = int(process_time * 10)  # Update every 100ms
+                    for step in range(steps):
+                        if progress_dialog.wasCanceled():
+                            raise Exception("Processing cancelled by user")
+                        progress = int((step / steps) * 100)
+                        status_label.setText(f"Processing... ({progress}%)")
+                        QApplication.processEvents()
+                        time.sleep(0.1)
+                    
+                    # TODO: Replace with actual transcription
+                    # transcription = self.transcribe_audio_file(audio_file)
+                    # self.save_transcription(transcription, audio_file)
+                    
+                    success_count += 1
+                    processed_count += 1
+                    elapsed = time.time() - start_time
+                    logging.info(f"Successfully processed {file_name} in {elapsed:.1f} seconds")
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    logging.error(f"Error processing {file_name}: {error_msg}", exc_info=True)
+                    failed_files.append((file_name, error_msg))
+                    status_label.setText(f"<font color='red'>Error processing {file_name}</font>")
+                    QApplication.processEvents()
+                    time.sleep(1)  # Pause to show error
+            
+            # Show completion status
+            if processed_count == 0:
+                status_text = "No files were processed."
+            else:
+                status_text = (
+                    f"<b>Import complete!</b><br>"
+                    f"• Successfully processed: <b>{success_count}</b> file{'' if success_count == 1 else 's'}<br>"
+                )
+                if failed_files:
+                    status_text += (
+                        f"• <font color='red'>Failed: {len(failed_files)} file{'' if len(failed_files) == 1 else 's'}</font>"
+                    )
+            
+            status_label.setText(status_text)
+            
+            # Show completion notification
+            self.tray_manager.show_notification(
+                "Import Complete" if not progress_dialog.wasCanceled() else "Import Cancelled",
+                f"Processed {success_count} of {len(audio_files)} files" + 
+                (f"\nFailed: {len(failed_files)}" if failed_files else ""),
+                QSystemTrayIcon.Information if success_count > 0 else QSystemTrayIcon.Warning
+            )
+            
+            # Log detailed results
+            logging.info(f"Import completed. Success: {success_count}, Failed: {len(failed_files)}")
+            for file_name, error in failed_files:
+                logging.error(f"Failed to process {file_name}: {error}")
+            
+            # Keep the dialog open for 5 seconds after completion
+            if not progress_dialog.wasCanceled():
+                QTimer.singleShot(5000, progress_widget.accept)
+            
+        except Exception as e:
+            error_msg = handle_error(e, "processing audio files")
+            logging.error(f"Error in _process_audio_files: {error_msg}", exc_info=True)
+            self.show_error_dialog.emit("Processing Error", error_msg)
+            progress_widget.close()
+        
+        return success_count, failed_files
+    
     def prompt_set_journal_dir(self):
         """Prompts the user to select a directory for saving journal entries."""
         # This method is only called from the tray (main thread), so safe to show dialog here
@@ -1814,7 +2354,7 @@ Journal Entry:
             output_file = self.settings.value("output_file")
             if not output_file:
                 raise ConfigurationError("No output file configured")
-                    
+            
             # Ensure the directory exists
             output_dir = os.path.dirname(output_file)
             if output_dir and not os.path.exists(output_dir):
@@ -1886,10 +2426,12 @@ Journal Entry:
                 
                 # If we're in journaling mode, create a journal entry
                 if hasattr(self, 'journaling_mode') and self.journaling_mode:
-                    self.handle_journal_entry(text)
+                    logging.info(f"[Journal] Passing audio_data to handle_journal_entry: {'set' if hasattr(self, 'audio_data') and self.audio_data is not None else 'not set'}")
+                    self.handle_journal_entry(text, audio_data=getattr(self, 'audio_data', None), sample_rate=getattr(self, 'sample_rate', 16000))
+                    self._clear_audio_data()
                 
                 return True
-                    
+            
             except (IOError, OSError) as e:
                 if os.path.exists(temp_file):
                     try:
@@ -1925,7 +2467,7 @@ Journal Entry:
             return False
 
 
-    def handle_journal_entry(self, text):
+    def handle_journal_entry(self, text, audio_data=None, sample_rate=16000):
         """
         Handle creating a journal entry with the transcribed text.
         
@@ -1963,7 +2505,12 @@ Journal Entry:
                 template_name = active_template if active_template else None
                 
                 # Create a journal entry with the transcribed text and template
-                entry_path = self.journal_manager.create_journal_entry(text, template_name=template_name)
+                # Pass audio_data and sample_rate if available
+                if audio_data is not None:
+                    logging.info(f"[Journal] Passing audio_data to create_journal_entry (type: {type(audio_data)})")
+                    entry_path = self.journal_manager.create_journal_entry(text, audio_data=audio_data, sample_rate=sample_rate, template_name=template_name)
+                else:
+                    entry_path = self.journal_manager.create_journal_entry(text, template_name=template_name)
                 
                 if not entry_path:
                     raise JournalingError("Failed to create journal entry: No entry path returned")
@@ -1971,6 +2518,7 @@ Journal Entry:
                 
                 # Reset journaling mode
                 self.journaling_mode = False
+                self._clear_audio_data()
                 
  HEAD
                 # Update the tray icon to show we're back to normal mode
@@ -1984,7 +2532,7 @@ Journal Entry:
                     "Your journal entry has been saved.",
 
                 # Reset the active template and custom settings
-                self._reset_active_template()
+    
                 
                 # Update the tray icon to show we're back to normal mode
                 self.tray_manager.update_icon(False)
@@ -2049,6 +2597,11 @@ Journal Entry:
             logging.error(f"Error in handle_journal_entry: {str(e)}", exc_info=True)
             raise
     
+    def _clear_audio_data(self):
+        """Clear stored audio data and sample rate to free memory."""
+        self.audio_data = None
+        self.sample_rate = 16000
+
     def stop_recording(self):
         """Stop the recording thread."""
         if not self.is_recording:
