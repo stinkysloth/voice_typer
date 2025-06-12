@@ -2279,24 +2279,21 @@ Journal Entry:
             
             try:
  
-                # Create a journal entry with the transcribed text
-                entry = self.journal_manager.create_journal_entry(text)
-                
-                if not entry or 'error' in entry:
-                    error_msg = entry.get('error', 'Unknown error') if isinstance(entry, dict) else 'Unknown error'
-                    raise JournalingError(f"Failed to create journal entry: {error_msg}")
-
                 # Get the active template name if any
-                active_template = self.journal_manager.active_template
+                active_template = getattr(self.journal_manager, 'active_template', None)
                 template_name = active_template if active_template else None
                 
                 # Create a journal entry with the transcribed text and template
                 # Pass audio_data and sample_rate if available
-                if audio_data is not None:
-                    logging.info(f"[Journal] Passing audio_data to create_journal_entry (type: {type(audio_data)})")
-                    entry_path = self.journal_manager.create_journal_entry(text, audio_data=audio_data, sample_rate=sample_rate, template_name=template_name)
-                else:
-                    entry_path = self.journal_manager.create_journal_entry(text, template_name=template_name)
+                try:
+                    if audio_data is not None:
+                        logging.info(f"[Journal] Passing audio_data to create_journal_entry (type: {type(audio_data)})")
+                        entry_path = self.journal_manager.create_journal_entry(text, audio_data=audio_data, sample_rate=sample_rate, template_name=template_name)
+                    else:
+                        entry_path = self.journal_manager.create_journal_entry(text, template_name=template_name)
+                except Exception as e:
+                    logging.error(f"Error in create_journal_entry: {str(e)}", exc_info=True)
+                    raise JournalingError(f"Failed to create journal entry: {str(e)}")
                 
                 if not entry_path:
                     raise JournalingError("Failed to create journal entry: No entry path returned")
@@ -2305,54 +2302,34 @@ Journal Entry:
                 self.journaling_mode = False
                 self._clear_audio_data()
                 
- 
-                # Update the tray icon to show we're back to normal mode
-                self.update_icon(False)
+                # Get the entry filename for logging
+                entry_filename = os.path.basename(entry_path) if entry_path else 'unknown'
+                logging.info(f"Journal entry created: {entry_filename}")
                 
-                logging.info(f"Journal entry created: {entry.get('id', 'unknown')}")
-                
-                # Show a notification
-                self.tray_icon.showMessage(
-                    "Journal Entry Created",
-                    "Your journal entry has been saved.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3000
-                )
-
-                # Reset the active template and custom settings
-    
-                
-                # Update the tray icon to show we're back to normal mode
-                self.tray_manager.update_icon(False)
-                
-                logging.info(f"Journal entry created: {os.path.basename(entry_path)}")
-                
-                # Show a notification with template info if applicable
+                # Prepare notification
                 notification_title = "Journal Entry Created"
                 notification_message = "Your journal entry has been saved."
                 
                 if template_name:
                     notification_message = f"Your journal entry has been saved using the '{template_name}' template."
                 
-                self.tray_manager.tray_icon.showMessage(
-                    notification_title,
-                    notification_message,
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3000
-                )
+                # Update UI and show notification
+                if hasattr(self, 'tray_manager'):
+                    self.tray_manager.update_icon(False)
+                    if hasattr(self.tray_manager, 'tray_icon'):
+                        self.tray_manager.tray_icon.showMessage(
+                            notification_title,
+                            notification_message,
+                            QSystemTrayIcon.MessageIcon.Information,
+                            3000
+                        )
+                    self.tray_manager.tray_icon.setToolTip("WhisperNotes - Ready")
                 
                 # Reset UI elements
                 if hasattr(self, 'toggle_action'):
                     self.toggle_action.setText("Start Recording")
- 
-                self.update_icon(False)
-                self.tray_icon.setToolTip("WhisperNotes - Ready")
                 
-                return entry
-
-                self.tray_manager.update_icon(False)
-                self.tray_manager.tray_icon.setToolTip("WhisperNotes - Ready")
-                
+                # Return the entry path and template info
                 return {"entry_path": entry_path, "template": template_name}
                 
             except Exception as e:

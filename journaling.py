@@ -383,7 +383,14 @@ class JournalingManager:
                 f.write(f"{entry['summary']}\n\n")
                 
                 # Add link to detailed entry
-                # Update the entry link to include the time
+                # Extract time from the timestamp (format: 'YYYY-MM-DD HH:MM:SS AM/PM')
+                try:
+                    timestamp = datetime.datetime.strptime(entry['timestamp'], '%Y-%m-%d %I:%M:%S %p')
+                    time_str = timestamp.strftime('%I%M%p').lower()
+                except (ValueError, KeyError) as e:
+                    logging.warning(f"Could not parse timestamp, using current time: {e}")
+                    time_str = datetime.datetime.now().strftime('%I%M%p').lower()
+                    
                 entry_link = f"[[{entry['date']} - {time_str} - Audio Journal Entry]]"
                 f.write(f"{entry_link}\n\n")
                 
